@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io"
 	"context"
 	"encoding/json"
 	"errors"
@@ -545,30 +546,73 @@ func (s *Service) ObjectExistsHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// objectExistsInS3 reports whether objectKey is present in the bucket.
+// objectExistsInS3 reports whether objectKey is present AND readable.
+//
+// "Present" means a ranged read of the first byte succeeds, not that a HEAD
+// answers. Ceph RGW can keep a multipart object's manifest and HEAD (with the
+// full size) while its data tail is gone, so HEAD says 200 and every GET says
+// 404 (garden#2933). Every caller that decides "already cached, skip the
+// upload" or "the NAR exists, the abort was harmless" goes through this one
+// definition, so none of them can be fooled by a HEAD-only check.
+//
+// Cost: one 1-byte GET instead of a HEAD. A zero-length object cannot satisfy
+// a range, so on InvalidRange we fall back to HEAD (nothing to lose a tail of).
 func (s *Service) objectExistsInS3(ctx context.Context, objectKey string) (bool, error) {
 	if err := s.S3RateLimiter.Wait(ctx); err != nil {
 		return false, fmt.Errorf("rate limiter: %w", err)
 	}
 
-	_, err := s.MinioClient.StatObject(ctx, s.Bucket, objectKey, minio.StatObjectOptions{})
+	exists, err := s.probeFirstByte(ctx, objectKey)
 	if err != nil {
 		if isRateLimitError(err) {
 			s.S3RateLimiter.RecordThrottle()
 		}
 
-		if minio.ToErrorResponse(err).Code == minio.NoSuchKey {
-			s.S3RateLimiter.RecordSuccess()
-
-			return false, nil
-		}
-
-		return false, fmt.Errorf("stat object %q: %w", objectKey, err)
+		return false, fmt.Errorf("read object %q: %w", objectKey, err)
 	}
 
 	s.S3RateLimiter.RecordSuccess()
 
-	return true, nil
+	return exists, nil
+}
+
+func (s *Service) probeFirstByte(ctx context.Context, objectKey string) (bool, error) {
+	opts := minio.GetObjectOptions{}
+	if err := opts.SetRange(0, 0); err != nil {
+		return false, fmt.Errorf("set range: %w", err)
+	}
+
+	obj, err := s.MinioClient.GetObject(ctx, s.Bucket, objectKey, opts)
+	if err != nil {
+		return false, fmt.Errorf("get object: %w", err)
+	}
+
+	defer func() { _ = obj.Close() }()
+
+	buf := make([]byte, 1)
+
+	n, err := io.ReadFull(obj, buf)
+	if n == 1 {
+		return true, nil
+	}
+
+	switch code := minio.ToErrorResponse(err).Code; code {
+	case minio.NoSuchKey:
+		return false, nil
+	case "InvalidRange":
+		_, statErr := s.MinioClient.StatObject(ctx, s.Bucket, objectKey, minio.StatObjectOptions{})
+		if statErr == nil {
+			return true, nil
+		}
+
+		if minio.ToErrorResponse(statErr).Code == minio.NoSuchKey {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("stat object: %w", statErr)
+	default:
+		return false, fmt.Errorf("read first byte: %w", err)
+	}
 }
 
 type signNarinfosRequest struct {
