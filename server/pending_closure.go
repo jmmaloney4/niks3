@@ -17,7 +17,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/minio/minio-go/v7"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -85,30 +84,17 @@ func (s *Service) checkS3ObjectsExist(ctx context.Context, objectKeys []string) 
 
 	for _, key := range objectKeys {
 		g.Go(func() error {
-			if err := s.S3RateLimiter.Wait(ctx); err != nil {
-				return fmt.Errorf("rate limiter: %w", err)
-			}
-
-			_, err := s.MinioClient.StatObject(ctx, s.Bucket, key, minio.StatObjectOptions{})
+			exists, err := s.objectExistsInS3(ctx, key)
 			if err != nil {
-				if isRateLimitError(err) {
-					s.S3RateLimiter.RecordThrottle()
-				}
-
-				errResp := minio.ToErrorResponse(err)
-				if errResp.Code == minio.NoSuchKey {
-					mu.Lock()
-					missingObjects[key] = true
-					mu.Unlock()
-					s.S3RateLimiter.RecordSuccess()
-
-					return nil
-				}
 				// Return error to cancel the group
 				return fmt.Errorf("failed to check S3 object %q: %w", key, err)
 			}
 
-			s.S3RateLimiter.RecordSuccess()
+			if !exists {
+				mu.Lock()
+				missingObjects[key] = true
+				mu.Unlock()
+			}
 
 			return nil
 		})
